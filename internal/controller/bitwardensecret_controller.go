@@ -285,12 +285,13 @@ func ApplySecretMap(bwSecret *operatorsv1.BitwardenSecret, secret *corev1.Secret
 	}
 
 	if bwSecret.Spec.SecretMap != nil {
+		newData := make(map[string][]byte)
 		for _, mappedSecret := range bwSecret.Spec.SecretMap {
 			if value, containsKey := secret.Data[mappedSecret.BwSecretId]; containsKey {
-				secret.Data[mappedSecret.SecretKeyName] = value
-				delete(secret.Data, mappedSecret.BwSecretId)
+				newData[mappedSecret.SecretKeyName] = value
 			}
 		}
+		secret.Data = newData
 	}
 }
 
