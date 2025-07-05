@@ -183,4 +183,100 @@ var _ = Describe("BitwardenSecret Reconciler - Success Tests", Ordered, func() {
 			g.Expect(updatedBwSecret.Status.LastSuccessfulSyncTime.Time).NotTo(BeZero())
 		}).Should(Succeed())
 	})
+
+	It("should reconcile when managed Secret is deleted", func() {
+		fixture.SetupDefaultCtrlMocks(false, nil)
+
+		_, err := fixture.CreateDefaultAuthSecret(namespace)
+		Expect(err).NotTo(HaveOccurred())
+
+		bwSecret, err := fixture.CreateDefaultBitwardenSecret(namespace, fixture.SecretMap)
+		Expect(err).NotTo(HaveOccurred())
+		Expect(bwSecret).NotTo(BeNil())
+
+		// First reconcile to create the Secret
+		req := reconcile.Request{NamespacedName: types.NamespacedName{Name: testutils.BitwardenSecretName, Namespace: namespace}}
+		result, err := fixture.Reconciler.Reconcile(fixture.Ctx, req)
+		Expect(err).NotTo(HaveOccurred())
+		Expect(result.RequeueAfter).To(Equal(time.Duration(fixture.Reconciler.RefreshIntervalSeconds) * time.Second))
+
+		// Wait for Secret to be created
+		Eventually(func(g Gomega) {
+			createdSecret := &corev1.Secret{}
+			g.Expect(fixture.K8sClient.Get(fixture.Ctx, types.NamespacedName{Name: testutils.SynchronizedSecretName, Namespace: namespace}, createdSecret)).Should(Succeed())
+		}).Should(Succeed())
+
+		// Delete the managed Secret
+		managedSecret := &corev1.Secret{}
+		err = fixture.K8sClient.Get(fixture.Ctx, types.NamespacedName{Name: testutils.SynchronizedSecretName, Namespace: namespace}, managedSecret)
+		Expect(err).NotTo(HaveOccurred())
+
+		err = fixture.K8sClient.Delete(fixture.Ctx, managedSecret)
+		Expect(err).NotTo(HaveOccurred())
+
+		// Setup the mocks to return no changes from Bitwarden to test Secret-side reconciliation
+		noChangesResponse := sdk.SecretsSyncResponse{
+			HasChanges: false,
+			Secrets:    []sdk.SecretResponse{},
+		}
+		fixture.SetupDefaultCtrlMocks(false, &noChangesResponse)
+
+		// Reconcile again - should recreate the Secret even with no Bitwarden changes
+		result, err = fixture.Reconciler.Reconcile(fixture.Ctx, req)
+		Expect(err).NotTo(HaveOccurred())
+		Expect(result.RequeueAfter).To(Equal(time.Duration(fixture.Reconciler.RefreshIntervalSeconds) * time.Second))
+
+		// Verify Secret is recreated
+		Eventually(func(g Gomega) {
+			recreatedSecret := &corev1.Secret{}
+			g.Expect(fixture.K8sClient.Get(fixture.Ctx, types.NamespacedName{Name: testutils.SynchronizedSecretName, Namespace: namespace}, recreatedSecret)).Should(Succeed())
+			g.Expect(recreatedSecret.Labels[controller.LabelBwSecret]).To(Equal(string(bwSecret.UID)))
+			g.Expect(len(recreatedSecret.Data)).To(Equal(testutils.ExpectedNumOfSecrets))
+		}).Should(Succeed())
+	})
+
+	It("should reconcile when managed Secret loses ownership label", func() {
+		fixture.SetupDefaultCtrlMocks(false, nil)
+
+		_, err := fixture.CreateDefaultAuthSecret(namespace)
+		Expect(err).NotTo(HaveOccurred())
+
+		bwSecret, err := fixture.CreateDefaultBitwardenSecret(namespace, fixture.SecretMap)
+		Expect(err).NotTo(HaveOccurred())
+		Expect(bwSecret).NotTo(BeNil())
+
+		// First reconcile to create the Secret
+		req := reconcile.Request{NamespacedName: types.NamespacedName{Name: testutils.BitwardenSecretName, Namespace: namespace}}
+		result, err := fixture.Reconciler.Reconcile(fixture.Ctx, req)
+		Expect(err).NotTo(HaveOccurred())
+
+		// Wait for Secret to be created and remove the ownership label
+		Eventually(func(g Gomega) {
+			managedSecret := &corev1.Secret{}
+			g.Expect(fixture.K8sClient.Get(fixture.Ctx, types.NamespacedName{Name: testutils.SynchronizedSecretName, Namespace: namespace}, managedSecret)).Should(Succeed())
+
+			// Remove the ownership label
+			delete(managedSecret.Labels, controller.LabelBwSecret)
+			g.Expect(fixture.K8sClient.Update(fixture.Ctx, managedSecret)).Should(Succeed())
+		}).Should(Succeed())
+
+		// Setup the mocks to return no changes from Bitwarden to test Secret-side reconciliation
+		noChangesResponse := sdk.SecretsSyncResponse{
+			HasChanges: false,
+			Secrets:    []sdk.SecretResponse{},
+		}
+		fixture.SetupDefaultCtrlMocks(false, &noChangesResponse)
+
+		// Reconcile again - should restore the ownership label even with no Bitwarden changes
+		result, err = fixture.Reconciler.Reconcile(fixture.Ctx, req)
+		Expect(err).NotTo(HaveOccurred())
+		Expect(result.RequeueAfter).To(Equal(time.Duration(fixture.Reconciler.RefreshIntervalSeconds) * time.Second))
+
+		// Verify Secret has the ownership label restored
+		Eventually(func(g Gomega) {
+			restoredSecret := &corev1.Secret{}
+			g.Expect(fixture.K8sClient.Get(fixture.Ctx, types.NamespacedName{Name: testutils.SynchronizedSecretName, Namespace: namespace}, restoredSecret)).Should(Succeed())
+			g.Expect(restoredSecret.Labels[controller.LabelBwSecret]).To(Equal(string(bwSecret.UID)))
+		}).Should(Succeed())
+	})
 })

@@ -92,8 +92,27 @@ func (r *BitwardenSecretReconciler) Reconcile(ctx context.Context, req ctrl.Requ
 
 	lastSync := bwSecret.Status.LastSuccessfulSyncTime
 
-	// Reconcile was queued by last sync time status update on the BitwardenSecret.  We will ignore it.
-	if !lastSync.IsZero() && time.Now().UTC().Before(lastSync.Time.Add(time.Duration(r.RefreshIntervalSeconds)*time.Second)) {
+	// Check if the managed Secret exists and is properly configured before honoring the refresh interval
+	k8sSecret := &corev1.Secret{}
+	namespacedK8sSecret := types.NamespacedName{
+		Name:      bwSecret.Spec.SecretName,
+		Namespace: req.NamespacedName.Namespace,
+	}
+
+	secretErr := r.Get(ctx, namespacedK8sSecret, k8sSecret)
+	secretMissing := secretErr != nil && errors.IsNotFound(secretErr)
+	secretNeedsUpdate := false
+
+	if !secretMissing && secretErr == nil {
+		// Check if Secret has the correct ownership label
+		if k8sSecret.Labels == nil || k8sSecret.Labels[LabelBwSecret] != string(bwSecret.UID) {
+			secretNeedsUpdate = true
+		}
+	}
+
+	// Reconcile was queued by last sync time status update on the BitwardenSecret.
+	// We will ignore it ONLY if the Secret is properly configured.
+	if !lastSync.IsZero() && time.Now().UTC().Before(lastSync.Time.Add(time.Duration(r.RefreshIntervalSeconds)*time.Second)) && !secretMissing && !secretNeedsUpdate {
 		return ctrl.Result{}, nil
 	}
 
@@ -142,16 +161,14 @@ func (r *BitwardenSecretReconciler) Reconcile(ctx context.Context, req ctrl.Requ
 		}, logErr
 	}
 
-	if refresh {
-		//Get The Bitwarden Secret from the K8s api
-		k8sSecret := &corev1.Secret{}
-
-		namespacedK8sSecret := types.NamespacedName{
-			Name:      bwSecret.Spec.SecretName,
-			Namespace: req.NamespacedName.Namespace,
+	if refresh || secretMissing || secretNeedsUpdate {
+		// If we need to refresh or the secret is missing/needs update, handle the Secret
+		if secretMissing {
+			// Re-fetch in case there was an error other than NotFound
+			err = r.Get(ctx, namespacedK8sSecret, k8sSecret)
+		} else {
+			err = secretErr
 		}
-
-		err = r.Get(ctx, namespacedK8sSecret, k8sSecret)
 
 		//Bitwarden secret doesn't exist; need to create it
 		if err != nil && errors.IsNotFound(err) {
@@ -201,7 +218,16 @@ func (r *BitwardenSecretReconciler) Reconcile(ctx context.Context, req ctrl.Requ
 			}, logError
 		}
 
-		if logError := r.LogCompletion(logger, ctx, bwSecret, fmt.Sprintf("Completed sync for %s/%s", req.NamespacedName.Namespace, req.Name)); logError != nil {
+		var syncReason string
+		if refresh {
+			syncReason = "changes from Bitwarden"
+		} else if secretMissing {
+			syncReason = "missing Secret"
+		} else if secretNeedsUpdate {
+			syncReason = "Secret configuration drift"
+		}
+
+		if logError := r.LogCompletion(logger, ctx, bwSecret, fmt.Sprintf("Completed sync for %s/%s (%s)", req.NamespacedName.Namespace, req.Name, syncReason)); logError != nil {
 			return ctrl.Result{
 				RequeueAfter: time.Duration(r.RefreshIntervalSeconds) * time.Second,
 			}, logError
@@ -223,6 +249,7 @@ func (r *BitwardenSecretReconciler) SetupWithManager(mgr ctrl.Manager) error {
 
 	return ctrl.NewControllerManagedBy(mgr).
 		For(&operatorsv1.BitwardenSecret{}).
+		Owns(&corev1.Secret{}).
 		Complete(r)
 }
 
